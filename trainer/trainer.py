@@ -45,9 +45,8 @@ class Trainer(object):
         # Init TF-graph
         self.init_graph()
 
-    def get_clip_op(self, adv_var=None, adv_per_var=None):
-        if adv_var is not None:
-            self.clip_op = self.clip_op_lambda(adv_var)
+    def get_clip_op(self, adv_var, adv_per_var=None):
+        self.clip_op = self.clip_op_lambda(adv_var)
         if adv_per_var is not None:
             self.per_clip_op = self.clip_op_lambda(adv_per_var)
         # tf.assign(adv_var, tf.clip_by_value(adv_var, 0.0, 1.0))
@@ -287,13 +286,27 @@ class Trainer(object):
 
         utility_mis_per = self.compute_utility(x_mis_per, a_mis_per, p_mis_per)
         u_mis_per = tf.reshape(utility_mis_per, u_shape) * self.u_mask
+        loss_2_per = -tf.reduce_sum(u_mis_per)
+
+        # Get mechanism for true valuation: Allocation and Payment
+        self.alloc, self.pay = self.net.inference(self.x)
 
         # Get mechanism for misreports: Allocation and Payment
         a_mis, p_mis = self.net.inference(self.misreports)
 
         # Utility
+        utility = self.compute_utility(self.x, self.alloc, self.pay)
+        self.utility = utility
         utility_per = self.compute_utility(self.x, self.alloc_per_out, self.pay_per_out)
         self.utility_per = utility_per
+
+        utility_mis = self.compute_utility(x_mis, a_mis, p_mis)
+
+        # Regret Computation
+        u_mis = tf.reshape(utility_mis, u_shape) * self.u_mask
+        utility_true = tf.tile(utility, [self.config.num_agents * self.config[self.mode].num_misreports, 1])
+        excess_from_utility = tf.nn.relu(tf.reshape(utility_mis - utility_true, u_shape) * self.u_mask)
+        rgt = tf.reduce_mean(tf.reduce_max(excess_from_utility, axis=(1, 3)), axis=1)
 
         # Regret Computation for permuation
         utility_per_true = tf.tile(utility_per, [self.config.num_agents * self.config[self.mode].num_misreports, 1])
@@ -301,8 +314,10 @@ class Trainer(object):
         rgt_per = tf.reduce_mean(tf.reduce_max(excess_from_utility_per, axis=(1, 3)), axis=1)
 
         # Metrics
-        revenue_per = self.compute_rev(self.pay_per_out)
+        revenue = self.compute_rev(self.pay)
+        rgt_mean = tf.reduce_mean(rgt)
         rgt_per_mean = tf.reduce_mean(rgt_per)
+        irp_mean = tf.reduce_mean(tf.nn.relu(-utility))
 
         # Variable Lists
         alloc_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='alloc')
@@ -320,11 +335,11 @@ class Trainer(object):
             self.increment_update_rate = update_rate.assign(update_rate + self.config.train.up_op_add)
 
             # Loss Functions
-            rgt_penalty = update_rate * tf.reduce_sum(tf.square(rgt_per)) / 2.0
-            lag_loss = tf.reduce_sum(self.w_rgt * rgt_per)
+            rgt_penalty = update_rate * tf.reduce_sum(tf.square(rgt)) / 2.0
+            lag_loss = tf.reduce_sum(self.w_rgt * rgt)
 
-            loss_1 = -revenue_per + rgt_penalty + lag_loss
-            loss_2 = -tf.reduce_sum(u_mis_per)
+            loss_1 = -revenue + rgt_penalty + lag_loss
+            loss_2 = -tf.reduce_sum(u_mis)
             loss_3 = -lag_loss
 
             reg_losses = tf.get_collection('reg_losses')
@@ -340,34 +355,36 @@ class Trainer(object):
             opt_3 = tf.train.GradientDescentOptimizer(update_rate)
 
             # Train ops
-            # self.train_op = opt_1.minimize(loss_1, var_list=var_list)
             self.train_op = opt_1.minimize(loss_1)
-            self.train_mis_step = opt_2.minimize(loss_2, var_list=[self.adv_var_per])
+            self.train_mis_step = opt_2.minimize(loss_2, var_list=[self.adv_var])
             self.lagrange_update = opt_3.minimize(loss_3, var_list=[self.w_rgt])
 
             # Val ops
             val_mis_opt = tf.train.AdamOptimizer(self.config.val.gd_lr)
-            self.val_mis_per_step = val_mis_opt.minimize(loss_2, var_list=[self.adv_var_per])
+            self.val_mis_step = val_mis_opt.minimize(loss_2, var_list=[self.adv_var])
+            self.val_mis_per_step = val_mis_opt.minimize(loss_2_per, var_list=[self.adv_var_per])
 
             # Reset ops
             self.reset_train_mis_opt = tf.variables_initializer(opt_2.variables())
             self.reset_val_mis_opt = tf.variables_initializer(val_mis_opt.variables())
 
-            self.train_metrics = [revenue_per, rgt_per_mean, rgt_penalty, lag_loss, loss_1, tf.reduce_mean(self.w_rgt),
+            # Metrics
+            self.train_metrics = [revenue, rgt_mean, rgt_penalty, lag_loss, loss_1, tf.reduce_mean(self.w_rgt),
                                   update_rate]
             self.train_metric_names = ["Revenue", "Regret", "Reg_Loss", "Lag_Loss", "Net_Loss",
                                        "w_rgt_mean", "update_rate"]
 
-            self.metrics = [revenue_per, rgt_per_mean, rgt_penalty, lag_loss, loss_1,
+            self.metrics = [revenue, rgt_mean, rgt_per_mean, rgt_penalty, lag_loss, loss_1,
                             tf.reduce_mean(self.w_rgt),
                             update_rate]
-            self.metric_names = ["Revenue", "Regret",
+            self.metric_names = ["Revenue", "Regret", "Regret_permutation",
                                  "Reg_Loss", "Lag_Loss", "Net_Loss",
                                  "w_rgt_mean", "update_rate"]
 
             # Summary
-            tf.summary.scalar('revenue', revenue_per)
-            tf.summary.scalar('regret', rgt_per_mean)
+            tf.summary.scalar('revenue', revenue)
+            tf.summary.scalar('regret', rgt_mean)
+            tf.summary.scalar('regret_per', rgt_per_mean)
             tf.summary.scalar('reg_loss', rgt_penalty)
             tf.summary.scalar('lag_loss', lag_loss)
             tf.summary.scalar('net_loss', loss_1)
@@ -379,19 +396,21 @@ class Trainer(object):
 
         elif self.mode == "test":
 
-            loss = -tf.reduce_sum(u_mis_per)
+            loss = -tf.reduce_sum(u_mis)
             test_mis_opt = tf.train.AdamOptimizer(self.config.test.gd_lr)
-            self.test_mis_step = test_mis_opt.minimize(loss, var_list=[self.adv_var_per])
+            self.test_mis_step = test_mis_opt.minimize(loss, var_list=[self.adv_var])
             self.reset_test_mis_opt = tf.variables_initializer(test_mis_opt.variables())
 
             # Metrics
-            self.metrics = [revenue_per, rgt_per_mean]
-            self.metric_names = ["Revenue_permutation", "Regret_permutation"]
+            welfare = tf.reduce_mean(tf.reduce_sum(self.alloc * self.x, axis=(1, 2)))
+            self.metrics = [revenue, rgt_mean, rgt_per_mean, irp_mean]
+            self.metric_names = ["Revenue", "Regret", "Regret_permutation", "IRP"]
             self.saver = tf.train.Saver(var_list=var_list)
 
         # Helper ops post GD steps
+        self.assign_op = tf.assign(self.adv_var, self.adv_init)
         self.assign_per_op = tf.assign(self.adv_var_per, self.adv_init)
-        self.get_clip_op(None, self.adv_var_per)
+        self.get_clip_op(self.adv_var, self.adv_var_per)
 
     def train(self, generator):
         """
@@ -424,14 +443,15 @@ class Trainer(object):
             tic = time.time()
 
             # Get Best Mis-report
+            sess.run(self.assign_op, feed_dict={self.adv_init: ADV})
             sess.run(self.assign_per_op, feed_dict={self.adv_init: ADV})
             for _ in range(self.config.train.gd_iter):
                 sess.run(self.train_mis_step, feed_dict={self.x: X})
-                sess.run(self.per_clip_op)
+                sess.run(self.clip_op)
             sess.run(self.reset_train_mis_opt)
 
             if self.config.train.data == "fixed" and self.config.train.adv_reuse:
-                self.train_gen.update_adv(perm, sess.run(self.adv_var_per))
+                self.train_gen.update_adv(perm, sess.run(self.adv_var))
 
             # Update network params
             sess.run(self.train_op, feed_dict={self.x: X})
@@ -479,8 +499,11 @@ class Trainer(object):
                 # metric_tot = np.zeros(len(self.train_metric_names))
                 for _ in range(self.config.val.num_batches):
                     X, ADV, _ = next(self.val_gen.gen_func)
+                    sess.run(self.assign_op, feed_dict={self.adv_init: ADV})
                     sess.run(self.assign_per_op, feed_dict={self.adv_init: ADV})
                     for k in range(self.config.val.gd_iter):
+                        sess.run(self.val_mis_step, feed_dict={self.x: X})
+                        sess.run(self.clip_op)
                         sess.run(self.val_mis_per_step, feed_dict={self.x: X})
                         sess.run(self.per_clip_op)
                     sess.run(self.reset_val_mis_opt)
@@ -521,18 +544,19 @@ class Trainer(object):
         for i in range(self.config.test.num_batches):
             tic = time.time()
             X, ADV, perm = next(self.test_gen.gen_func)
+            sess.run(self.assign_op, feed_dict={self.adv_init: ADV})
             sess.run(self.assign_per_op, feed_dict={self.adv_init: ADV})
 
             for k in range(self.config.test.gd_iter):
                 sess.run(self.test_mis_step, feed_dict={self.x: X})
-                sess.run(self.per_clip_op)
+                sess.run(self.clip_op)
 
             sess.run(self.reset_test_mis_opt)
 
             metric_vals = sess.run(self.metrics, feed_dict={self.x: X})
 
             if self.config.test.save_output:
-                A, P = sess.run([self.alloc_per_out, self.pay_per_out], feed_dict={self.x: X})
+                A, P = sess.run([self.alloc, self.pay], feed_dict={self.x: X})
                 alloc_tst[perm, :, :] = A
                 pay_tst[perm, :] = P
 
